@@ -1,46 +1,30 @@
 #!/usr/bin/env python3
-"""종교시설 찾기 — Kakao 공개 모바일 지도 표면 기반 (API 키 불필요).
+"""종교시설 찾기 — 공식 Kakao Local API (k-skill-proxy 경유).
 
 공개 접근 경로:
-  1) m.map.kakao.com/actions/searchView  → 검색 결과 HTML에서 place id(cid) 추출
-  2) place-api.map.kakao.com/places/panel3/<cid> → 이름·좌표·주소·전화·홈페이지 JSON
+  1) GET {proxy}/v1/kakao-map/search/keyword?q=<위치> → 기준점 좌표 (anchor)
+  2) GET {proxy}/v1/kakao-map/search/keyword?q=<종류>&x=..&y=..&radius=..&sort=distance
+     → 거리순 장소 목록 (공식 distance 필드 사용)
 
-Kakao 장소 분류의 category.name2 == "종교" 로 필터하므로
+upstream이 Kakao Developers REST API 키를 요구하므로 k-skill-proxy를 거친다
+(사용자 머신에는 키가 필요 없고, 프록시 운영자 키로 인증한다).
+category_name에 "종교" 노드가 있는 결과만 통과시키므로
 이름에 "교회"가 들어간 카페·서점 같은 오탐이 걸러진다.
 """
 
 import argparse
 import json
-import math
+import os
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
-SEARCH_VIEW_URL = "https://m.map.kakao.com/actions/searchView"
-PLACE_PANEL_URL = "https://place-api.map.kakao.com/places/panel3"
-PLACE_PAGE_URL = "https://place.map.kakao.com"
+DEFAULT_PROXY_BASE = "https://k-skill-proxy.nomadamas.org"
+SEARCH_KEYWORD_PATH = "/v1/kakao-map/search/keyword"
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-)
-BROWSER_HEADERS = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "ko,en-US;q=0.9,en;q=0.8",
-    "user-agent": USER_AGENT,
-}
-PANEL_HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "accept-language": "ko,en-US;q=0.9,en;q=0.8",
-    "user-agent": USER_AGENT,
-    "appVersion": "6.6.0",
-    "pf": "PC",
-    "origin": "https://place.map.kakao.com",
-    "referer": "https://place.map.kakao.com/",
-}
+USER_AGENT = "k-skill-religious-facility-search/1"
 
 RELIGION_CATEGORY = "종교"
 TYPE_ALIASES = {
@@ -50,114 +34,96 @@ TYPE_ALIASES = {
     "사찰": ["절", "사찰"],
     "전체": [],
 }
+# --type 전체: "종교시설" 단일 키워드는 교회·사찰을 놓치므로 종류별로 합친다
+ALL_TYPE_QUERIES = ["교회", "성당", "사찰"]
 COORD_RE = re.compile(r"^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$")
-CID_RE = re.compile(r'data-cid="(\d+)"')
-MAX_CANDIDATES = 15  # upstream searchView가 한 번에 돌려주는 최대 장소 수
+PAGE_SIZE = 15          # Kakao Local keyword 검색의 페이지당 최대 건수
+MAX_PAGES = 3           # 페이지네이션 상한 → 최대 45개 후보
+MAX_CANDIDATES = PAGE_SIZE * MAX_PAGES
 
 
 class LookupError_(Exception):
     """조회 실패를 명시적 실패 모드로 올린다."""
 
 
-def fetch(url, headers, timeout=15, as_json=False):
-    request = urllib.request.Request(url, headers=headers)
+def proxy_base():
+    return (os.environ.get("KSKILL_PROXY_BASE_URL") or DEFAULT_PROXY_BASE).rstrip("/")
+
+
+def fetch_json(url, timeout=15):
+    request = urllib.request.Request(url, headers={"user-agent": USER_AGENT, "accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as error:
-        raise LookupError_(f"HTTP {error.code} from {urllib.parse.urlsplit(url).netloc}") from error
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        raise LookupError_(f"프록시 HTTP {error.code} ({detail or '응답 본문 없음'})") from error
     except urllib.error.URLError as error:
         raise LookupError_(f"네트워크 오류: {error.reason}") from error
 
-    if as_json:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise LookupError_("장소 상세 응답이 JSON이 아니다 (upstream 변경 가능)") from error
-    return raw
-
-
-def search_place_ids(query, limit=MAX_CANDIDATES):
-    url = f"{SEARCH_VIEW_URL}?{urllib.parse.urlencode({'q': query})}"
-    html = fetch(url, BROWSER_HEADERS)
-
-    seen, ids = set(), []
-    for cid in CID_RE.findall(html):
-        if cid not in seen:
-            seen.add(cid)
-            ids.append(cid)
-        if len(ids) >= limit:
-            break
-    return ids
-
-
-def fetch_place(cid):
     try:
-        payload = fetch(f"{PLACE_PANEL_URL}/{cid}", PANEL_HEADERS, as_json=True)
-    except LookupError_:
-        return None
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LookupError_("프록시 응답이 JSON이 아니다 (proxy 변경 가능)") from error
 
-    summary = payload.get("summary") or {}
-    point = summary.get("point") or {}
-    address = summary.get("address") or {}
-    category = summary.get("category") or {}
-    if not summary.get("name") or not point.get("lat"):
-        return None
 
-    phones = [p.get("tel") for p in (summary.get("phone_numbers") or []) if p.get("type") != "FAX"]
+def search_places(query, x=None, y=None, radius=None, max_pages=MAX_PAGES):
+    """proxy keyword 검색. (documents, meta)를 돌려준다. 첫 페이지가 비면 명시적 실패."""
+    params = {"q": query, "size": PAGE_SIZE}
+    if x is not None and y is not None:
+        params.update({"x": x, "y": y, "sort": "distance"})
+        if radius:
+            params["radius"] = radius
+
+    documents, meta = [], {}
+    for page in range(1, max_pages + 1):
+        params["page"] = page
+        url = f"{proxy_base()}{SEARCH_KEYWORD_PATH}?{urllib.parse.urlencode(params)}"
+        payload = fetch_json(url)
+        batch = payload.get("documents") or []
+        meta = payload.get("meta") or {}
+        documents.extend(batch)
+        if page == 1 and not documents:
+            raise LookupError_(f'"{query}" 검색 결과가 비었다 (검색어를 넓히거나 지역명을 붙여볼 것)')
+        if meta.get("is_end", True) or not batch:
+            break
+    return documents, meta
+
+
+def map_place(document):
+    parts = [p.strip() for p in (document.get("category_name") or "").split(">") if p.strip()]
+    distance_raw = (document.get("distance") or "").strip()
     return {
-        "id": cid,
-        "name": summary.get("name"),
-        "category": category.get("name4") or category.get("name"),
-        "denomination": category.get("name3"),
-        "category_group": category.get("name2"),
-        "lat": point.get("lat"),
-        "lon": point.get("lon"),
-        "address": address.get("disp") or address.get("road"),
-        "jibun": address.get("jibun"),
-        "phone": phones[0] if phones else None,
-        "homepage": (summary.get("homepages") or [None])[0],
-        "place_url": f"{PLACE_PAGE_URL}/{cid}",
+        "id": document.get("id"),
+        "name": document.get("place_name"),
+        "category": parts[-1] if parts else None,
+        "denomination": parts[-2] if len(parts) >= 4 else None,
+        "category_group": RELIGION_CATEGORY if RELIGION_CATEGORY in parts else None,
+        "lat": float(document["y"]) if document.get("y") else None,
+        "lon": float(document["x"]) if document.get("x") else None,
+        "address": (document.get("road_address_name") or document.get("address_name") or "").strip() or None,
+        "jibun": (document.get("address_name") or "").strip() or None,
+        "phone": (document.get("phone") or "").strip() or None,
+        "homepage": None,  # Kakao Local API는 외부 홈페이지를 제공하지 않는다
+        "place_url": document.get("place_url"),
+        "distance_m": int(distance_raw) if distance_raw else None,
     }
-
-
-def haversine_m(lat1, lon1, lat2, lon2):
-    radius = 6371000.0
-    d_lat = math.radians(lat2 - lat1)
-    d_lon = math.radians(lon2 - lon1)
-    a = (
-        math.sin(d_lat / 2) ** 2
-        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
-    )
-    return radius * 2 * math.asin(math.sqrt(a))
-
-
-def anchor_score(place, location):
-    """검색어에 가까운 이름일수록 좋은 기준점. (점수, 이름길이, 등장순서)로 정렬한다."""
-    name = (place.get("name") or "").replace(" ", "")
-    target = location.replace(" ", "")
-    if name == target:
-        return 0
-    if name.startswith(target):
-        return 1
-    if target in name:
-        return 2
-    return 3
 
 
 def resolve_anchor(location):
     """위치 문자열을 좌표로 바꾼다. 실패하면 None (거리 없이 결과만 제공)."""
-    candidates = []
-    for order, cid in enumerate(search_place_ids(location, limit=6)):
-        place = fetch_place(cid)
-        if place:
-            candidates.append((anchor_score(place, location), len(place["name"]), order, place))
-
-    if not candidates:
+    try:
+        documents, _ = search_places(location)
+    except LookupError_:
         return None
-
-    best = min(candidates)[3]
-    return {"name": best["name"], "lat": best["lat"], "lon": best["lon"]}
+    if not documents:
+        return None
+    top = documents[0]
+    return {"name": top.get("place_name"), "lat": float(top["y"]), "lon": float(top["x"])}
 
 
 def matches_type(place, facility_type):
@@ -170,24 +136,38 @@ def matches_type(place, facility_type):
     return any(token in haystack for token in wanted)
 
 
+def _dedupe_by_id(places):
+    seen, unique = set(), []
+    for place in places:
+        if place["id"] not in seen:
+            seen.add(place["id"])
+            unique.append(place)
+    return unique
+
+
 def collect(query, facility_type, anchor, radius_m, limit):
-    ids = search_place_ids(query)
-    if not ids:
-        raise LookupError_(f'"{query}" 검색 결과가 비었다 (검색어를 넓히거나 지역명을 붙여볼 것)')
+    x = y = None
+    if anchor:
+        x, y = anchor["lon"], anchor["lat"]
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        places = [p for p in pool.map(fetch_place, ids) if p]
+    if facility_type == "전체" and query == "전체":
+        # "종교시설" 단일 검색은 교회·사찰을 놓치므로 종류별 검색을 합친다
+        documents, scanned = [], 0
+        for token in ALL_TYPE_QUERIES:
+            docs, _ = search_places(token, x=x, y=y, radius=radius_m)
+            scanned += len(docs)
+            documents.extend(docs)
+    else:
+        documents, _ = search_places(query, x=x, y=y, radius=radius_m)
+        scanned = len(documents)
 
+    places = _dedupe_by_id(map_place(doc) for doc in documents)
     places = [p for p in places if matches_type(p, facility_type)]
 
     if anchor:
-        for place in places:
-            place["distance_m"] = round(haversine_m(anchor["lat"], anchor["lon"], place["lat"], place["lon"]))
-        if radius_m:
-            places = [p for p in places if p["distance_m"] <= radius_m]
-        places.sort(key=lambda p: p["distance_m"])
+        places.sort(key=lambda p: (p["distance_m"] is None, p["distance_m"] or 0))
 
-    return len(ids), len(places), places[:limit]
+    return scanned, len(places), places[:limit]
 
 
 def format_report(query, anchor, scanned, matched, places, facility_type):
@@ -229,12 +209,12 @@ def format_report(query, anchor, scanned, matched, places, facility_type):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="종교시설 찾기 (Kakao 공개 표면, API 키 불필요)")
+    parser = argparse.ArgumentParser(description="종교시설 찾기 (공식 Kakao Local API, k-skill-proxy 경유)")
     parser.add_argument("location", nargs="?", help="동네·역명·랜드마크 (예: 강남역, 성수동)")
     parser.add_argument("--name", help="교회/시설 이름으로 직접 검색")
     parser.add_argument("--type", default="교회", choices=sorted(TYPE_ALIASES), help="시설 종류 (기본: 교회)")
-    parser.add_argument("--radius", type=int, help="기준 위치로부터 최대 거리(m)")
-    parser.add_argument("--limit", type=int, default=5, help="표시 개수 (기본 5, 최대 15)")
+    parser.add_argument("--radius", type=int, help="기준 위치로부터 최대 거리(m, 최대 20000)")
+    parser.add_argument("--limit", type=int, default=5, help=f"표시 개수 (기본 5, 최대 {MAX_CANDIDATES})")
     parser.add_argument("--json", action="store_true", help="JSON으로 출력")
     args = parser.parse_args()
 
@@ -242,19 +222,28 @@ def main():
         parser.error("location 또는 --name 중 하나는 필요하다. 사용자에게 현재 위치를 먼저 물어볼 것.")
 
     if not 1 <= args.limit <= MAX_CANDIDATES:
-        parser.error(f"--limit은 1~{MAX_CANDIDATES} 사이여야 한다. upstream 검색이 한 번에 최대 "
-                     f"{MAX_CANDIDATES}건만 반환하므로 그보다 많이 표시할 수 없다.")
+        parser.error(f"--limit은 1~{MAX_CANDIDATES} 사이여야 한다. 페이지 {MAX_PAGES}장(페이지당 "
+                     f"{PAGE_SIZE}건)까지만 가져오므로 그보다 많이 표시할 수 없다.")
+
+    if args.radius is not None and not 1 <= args.radius <= 20000:
+        parser.error("--radius는 1~20000(m) 사이여야 한다. Kakao Local API의 상한이다.")
 
     if args.location and COORD_RE.match(args.location):
         parser.error("좌표 검색은 지원하지 않는다. 동네·역명·랜드마크로 입력할 것 (예: 강남역, 성수동).")
 
     if args.name:
-        query = f"{args.location} {args.name}".strip() if args.location else args.name
+        # 위치는 좌표(x,y)로 전달하므로 검색어는 시설 이름만 쓴다
+        # ("강남역 온누리교회"처럼 붙이면 keyword API가 0건을 돌려준다)
+        query = args.name
+    elif args.type == "전체":
+        query = args.type  # collect()가 종류별 검색으로 풀어서 합친다
     else:
-        query = f"{args.location} {args.type}"
+        query = args.type
 
     try:
         anchor = resolve_anchor(args.location) if args.location else None
+        if args.location and anchor is None:
+            print(f"기준 위치 \"{args.location}\"을(를) 찾지 못해 거리 없이 조회한다.", file=sys.stderr)
         scanned, matched, places = collect(query, args.type, anchor, args.radius, args.limit)
     except LookupError_ as error:
         print(f"조회 실패: {error}", file=sys.stderr)
