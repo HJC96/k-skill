@@ -126,14 +126,23 @@ def resolve_anchor(location):
     return {"name": top.get("place_name"), "lat": float(top["y"]), "lon": float(top["x"])}
 
 
+def _category_tokens(place):
+    tokens = []
+    for part in (place.get("category"), place.get("denomination")):
+        if not part:
+            continue
+        tokens.extend(token.strip() for token in part.replace(",", " ").split() if token.strip())
+    return tokens
+
+
 def matches_type(place, facility_type):
     if place.get("category_group") != RELIGION_CATEGORY:
         return False
     wanted = TYPE_ALIASES.get(facility_type, [facility_type])
     if not wanted:
         return True
-    haystack = f"{place.get('category') or ''} {place.get('denomination') or ''}"
-    return any(token in haystack for token in wanted)
+    tokens = _category_tokens(place)
+    return any(token in tokens for token in wanted)
 
 
 def _dedupe_by_id(places):

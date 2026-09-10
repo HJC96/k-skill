@@ -58,6 +58,10 @@ GENERIC_RELIGION_DOC = document(
     "771227219", "명동성당 꼬스트홀", "문화,예술 > 종교 > 종교시설",
     distance="57", road="서울 중구 명동길 74",
 )
+MISSION_DOC = document(
+    "1260008236", "KAM선교회", "문화,예술 > 종교 > 기독교 > 선교회",
+    distance="294", road="서울 강남구 강남대로98길 16",
+)
 
 
 class SearchEndpointTest(unittest.TestCase):
@@ -169,6 +173,12 @@ class MatchesTypeTest(unittest.TestCase):
         place = religious_facility_search.map_place(GENERIC_RELIGION_DOC)
         self.assertFalse(religious_facility_search.matches_type(place, "교회"))
         self.assertFalse(religious_facility_search.matches_type(place, "성당"))
+
+    def test_mission_org_is_not_a_church(self):
+        place = religious_facility_search.map_place(MISSION_DOC)
+        self.assertEqual(place["category"], "선교회")
+        self.assertFalse(religious_facility_search.matches_type(place, "교회"))
+        self.assertTrue(religious_facility_search.matches_type(place, "전체"))
 
 
 class ResolveAnchorTest(unittest.TestCase):
