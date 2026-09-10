@@ -152,11 +152,17 @@ def collect(query, facility_type, anchor, radius_m, limit):
 
     if facility_type == "전체" and query == "전체":
         # "종교시설" 단일 검색은 교회·사찰을 놓치므로 종류별 검색을 합친다
-        documents, scanned = [], 0
+        documents, scanned, hits = [], 0, 0
         for token in ALL_TYPE_QUERIES:
-            docs, _ = search_places(token, x=x, y=y, radius=radius_m)
+            try:
+                docs, _ = search_places(token, x=x, y=y, radius=radius_m)
+            except LookupError_:
+                continue  # 한 종류가 0건이어도 나머지 종류는 돌려준다
+            hits += 1
             scanned += len(docs)
             documents.extend(docs)
+        if hits == 0:
+            raise LookupError_('"전체" 검색 결과가 비었다 (지역을 넓히거나 --type을 좁혀볼 것)')
     else:
         documents, _ = search_places(query, x=x, y=y, radius=radius_m)
         scanned = len(documents)

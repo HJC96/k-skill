@@ -193,7 +193,7 @@ npx --yes skills add NomaDamas/k-skill --skill railway-timetable -g
 
 | 할 수 있는 일 | 스킬 이름 | 설명 |
 | --- | --- | --- |
-| [종교시설 찾기](docs/features/religious-facility-search.md) | `religious-facility-search` | 동네·역명·랜드마크 기준 근처 교회·성당·사찰 거리순 조회와 주소·전화·홈페이지 정리 (사용자 키 불필요) |
+| [종교시설 찾기](docs/features/religious-facility-search.md) | `religious-facility-search` | 동네·역명·랜드마크 기준 근처 교회·성당·사찰 거리순 조회와 주소·전화·카카오맵 링크 정리 (사용자 키 불필요) |
 
 ### 🎓 교육·장학·학술
 
